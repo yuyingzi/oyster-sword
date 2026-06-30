@@ -1,6 +1,6 @@
 # Oyster knife
 
-A personal collection of the most useful AI coding skills and workflows.
+My personal collection of the most useful AI coding skills and workflows.
 
 ## What's here
 
