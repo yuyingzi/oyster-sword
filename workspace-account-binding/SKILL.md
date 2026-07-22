@@ -30,7 +30,7 @@ Rules the script enforces:
 - **Post-switch verification**: re-run the CLI's own `config show` and confirm the expected app id — never trust the write blindly.
 - **Never call the CLI's lifecycle commands** (`config init` / `config remove`). See pitfalls.
 
-Reference implementation (lark-cli): hardcode an `ACCOUNTS = {name: {appId, desc}}` map, load config.json, `apps.insert(0, apps.pop(idx))`, atomic replace, verify via `subprocess` call to `config show`.
+Reference implementation: [`lark-switch.example`](lark-switch.example) — copy to `~/.claude/bin/<cli>-switch`, fill in your own `ACCOUNTS` map (app ids are client-id-like identifiers, safe to hardcode; **secrets never appear in the script or config — they live in the OS keychain**).
 
 ### 3. Workspace declaration
 

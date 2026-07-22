@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""lark-switch — 切换 lark-cli 当前账号（重排 ~/.lark-cli/config.json 的 apps 数组，CLI 只认 apps[0]）。
+
+用法:
+  lark-switch status            查看当前账号
+  lark-switch work|personal     切换并校验
+
+密钥/token 全在 macOS 钥匙串，本脚本只动 JSON 顺序，绝不调用 config init/remove。
+工作区绑定：各项目 CLAUDE.md 声明「lark 账号=work|personal」，agent 操作飞书前先切换。
+"""
+import json, os, subprocess, sys, tempfile
+
+CONFIG = os.path.expanduser("~/.lark-cli/config.json")
+ACCOUNTS = {
+    "work":     {"appId": "cli_xxxxxxxxxxxxxxxx", "desc": "Work tenant — company docs"},
+    "personal": {"appId": "cli_yyyyyyyyyyyyyyyy", "desc": "Personal tenant — personal knowledge base"},
+}
+
+def load():
+    with open(CONFIG) as f:
+        return json.load(f)
+
+def name_of(app_id):
+    for k, v in ACCOUNTS.items():
+        if v["appId"] == app_id:
+            return k
+    return "unknown"
+
+def status(cfg):
+    apps = cfg.get("apps", [])
+    if not apps:
+        print("✗ config.json 里没有任何 app"); return 1
+    active = apps[0]["appId"]
+    k = name_of(active)
+    print(f"当前账号: {k}  ({active})")
+    if k in ACCOUNTS: print(f"  {ACCOUNTS[k]['desc']}")
+    others = [name_of(a["appId"]) for a in apps[1:]]
+    if others: print(f"备用: {', '.join(others)}")
+    missing = [k for k, v in ACCOUNTS.items() if v["appId"] not in [a["appId"] for a in apps]]
+    if missing: print(f"⚠ 未注册进 config.json: {', '.join(missing)}")
+    return 0
+
+def switch(cfg, target):
+    want = ACCOUNTS[target]["appId"]
+    apps = cfg.get("apps", [])
+    idx = next((i for i, a in enumerate(apps) if a["appId"] == want), None)
+    if idx is None:
+        print(f"✗ {target} ({want}) 不在 config.json 里，无法切换。修复参见 memory: lark-cli-dual-account")
+        return 1
+    apps.insert(0, apps.pop(idx))
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONFIG))
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, CONFIG)
+    # 校验：让 CLI 自己报告它认到的 app
+    out = subprocess.run(["lark-cli", "config", "show"], capture_output=True, text=True).stdout
+    if want in out:
+        print(f"✓ 已切换到 {target}"); print(f"  {ACCOUNTS[target]['desc']}")
+        if '"users": "(no logged-in users)"' in out:
+            print("⚠ 该账号还没有已登录用户，需要 lark-cli auth login")
+        return 0
+    print(f"✗ 切换后校验失败，config show 未显示 {want}:\n{out}")
+    return 1
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if arg not in ("status", "work", "personal"):
+        print(__doc__); return 2
+    cfg = load()
+    return status(cfg) if arg == "status" else switch(cfg, arg)
+
+if __name__ == "__main__":
+    sys.exit(main())
