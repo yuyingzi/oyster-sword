@@ -1,4 +1,4 @@
-# Oyster knife
+# Oyster sword
 
 My personal collection of the most useful AI coding skills and workflows.
 
@@ -22,7 +22,7 @@ Multi-account CLI switching for agents — each workspace declares which account
 
 ```bash
 # Clone with submodules
-git clone --recurse-submodules https://github.com/yuyingzi/oyster-knife.git
+git clone --recurse-submodules https://github.com/yuyingzi/oyster-sword.git
 
 # Or if already cloned
 git submodule update --init
