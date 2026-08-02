@@ -1,0 +1,12 @@
+# Generated as ~/.codex/deepseek.config.toml by ./codex-deepseek install.
+# The API key is read from DEEPSEEK_API_KEY and is not stored here.
+model = "deepseek-v4-flash"
+model_provider = "deepseek"
+model_reasoning_effort = "high"
+model_catalog_json = "~/.codex/model-catalogs/deepseek.json"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+env_key = "DEEPSEEK_API_KEY"
