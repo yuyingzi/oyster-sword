@@ -18,9 +18,6 @@ PR heartbeat skill — polls a GitHub PR on an interval, resolves conflicts, add
 ### `workspace-account-binding/`
 Multi-account CLI switching for agents — each workspace declares which account (work/personal) it uses, agents verify-then-switch via one audited command. No env hacks, no config-file swapping; includes the hard-won pitfalls (lifecycle commands wiping keychain secrets, human-only secret re-entry).
 
-### `codex-deepseek-profile/`
-Run Codex with `deepseek-v4-flash` through an isolated profile while keeping the default OpenAI configuration unchanged. Includes a safe installer, status/uninstall commands, and an isolated install test.
-
 ## Setup
 
 ```bash
