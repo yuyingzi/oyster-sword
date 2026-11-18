@@ -1,13 +1,11 @@
 import asyncio
-import json
 from typing import TYPE_CHECKING
 
+from .connection import DEFAULT_OUTPUT_LIMIT_FIELD
 from .control import retry_after_seconds
 
 if TYPE_CHECKING:
     import httpx
-
-    from .task import Task
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 QUOTA_ERROR_CODES = {"insufficient_quota", "billing_hard_limit_reached"}
@@ -45,23 +43,27 @@ async def mock_complete(text: str) -> dict[str, object]:
 
 
 class OpenAICompatible:
-    def __init__(self, client: "httpx.AsyncClient", model: str, max_output_tokens: int, task: "Task") -> None:
+    def __init__(
+        self, client: "httpx.AsyncClient", model: str, max_output_tokens: int, system_prompt: str,
+        *, output_limit_field: str = DEFAULT_OUTPUT_LIMIT_FIELD,
+    ) -> None:
         self.client = client
         self.model = model
         self.max_output_tokens = max_output_tokens
-        self.task = task
+        self.system_prompt = system_prompt
+        self.output_limit_field = output_limit_field
 
-    async def complete(self, text: str) -> dict[str, object]:
+    async def complete(self, text: str) -> str:
         import httpx
 
         try:
             response = await self.client.post("chat/completions", json={
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": self.task.system_prompt},
+                    {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": text},
                 ],
-                "max_completion_tokens": self.max_output_tokens,
+                self.output_limit_field: self.max_output_tokens,
             })
         except httpx.TimeoutException as error:
             raise RetryableError("http_timeout") from error
@@ -89,20 +91,15 @@ class OpenAICompatible:
         try:
             choice = response.json()["choices"][0]
             message = choice["message"]
-            raw = message["content"]
             if choice.get("finish_reason") == "length":
                 raise RowError("output_truncated")
+            if not isinstance(message, dict):
+                raise RowError("invalid_provider_response")
             if message.get("refusal") or choice.get("finish_reason") == "content_filter":
                 raise RowError("provider_refusal")
+            raw = message["content"]
             if not isinstance(raw, str):
                 raise RowError("invalid_provider_response")
         except (KeyError, IndexError, TypeError, ValueError, RecursionError) as error:
             raise RowError("invalid_provider_response") from error
-        try:
-            result = json.loads(raw)
-            if isinstance(result, dict) and self.task.is_valid(result):
-                json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
-                return result
-        except (ValueError, RecursionError):
-            pass
-        raise RowError("invalid_output_schema")
+        return raw

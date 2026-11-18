@@ -37,7 +37,9 @@ class Store:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
-    def initialize(self, source: Path, task: dict[str, object]) -> None:
+    def initialize(
+        self, source: Path, task: dict[str, object], *, legacy_task: dict[str, object] | None = None,
+    ) -> None:
         self.connection.executescript("""
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=FULL;
@@ -68,7 +70,11 @@ class Store:
         if existing:
             with source.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            if existing != (signature, digest):
+            old_signature, old_digest = existing
+            accepted = {signature}
+            if legacy_task is not None:
+                accepted.add(json.dumps(legacy_task, sort_keys=True))
+            if old_digest != digest or old_signature not in accepted:
                 raise ValueError("input or task settings changed; choose a new --db")
             return
 

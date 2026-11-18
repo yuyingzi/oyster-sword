@@ -32,24 +32,35 @@ python3 -m llm_batch export --db work/failures.sqlite --output work/failures.jso
 
 1. 把源数据转换成 UTF-8 JSONL，选择稳定的 `id`，把用于模型处理的字段组装为 `text`。保留相同输入文件以便续跑。
 2. 填写 [`task.json`](task.json) 的 `prompt` 和 `output_schema`。有标签词表时再填写 `labels`，它会随提示词发给模型。字段名、字段类型、必填项和允许值由 JSON Schema 决定。如果标签需要严格校验，在对应字段的 schema 里用 `enum`。输出为 JSON 对象，内部可以包含数组、数值或嵌套对象。需要自定义配置路径时传入 `--task`。
-3. 选择新数据库，用小样本跑通输入、校验、持久化、导出和续跑，再按服务商配额压测。实际 HTTP 适配器使用 `/chat/completions` 和 `max_completion_tokens`。如果你的兼容接口使用其他字段，请修改适配器的请求与响应映射。
+3. 复制 [`llm.toml`](llm.toml) 得到一份连接配置，填写 `base_url`、`model` 和 `output_limit_field`，然后用 `--llm` 指向这份配置。不同模型或中转服务可各用一份。选择新数据库，先跑 1–3 条样本验证连接和结构校验，再扩大批次。
+
+| 配置项 | 填写方式 |
+| --- | --- |
+| `protocol` | 当前支持 `chat-completions`。 |
+| `base_url` | 填 HTTP(S) API 根地址，如 `https://api.openai.com/v1`。适配器会追加 `/chat/completions`。 |
+| `model` | 填该端点提供的模型 ID。 |
+| `api_key_env` | 填保存密钥的环境变量名称。默认是 `LLM_API_KEY`，也可以使用 `DEEPSEEK_API_KEY` 等名称。 |
+| `output_limit_field` | OpenAI Chat Completions 填 `max_completion_tokens`，DeepSeek Chat Completions 填 `max_tokens`。中转端点以其接口文档为准。实际输出上限由 `--max-output-tokens` 设置。 |
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-export LLM_BASE_URL='https://api.openai.com/v1'
-export LLM_MODEL='your-model-id'
+mkdir -p work
+cp llm.toml work/endpoint.toml
+# 填写 work/endpoint.toml 和 task.json 后运行下面的命令。
 printf 'LLM API key: '
 IFS= read -rs LLM_API_KEY
 printf '\n'
 export LLM_API_KEY
-python -m llm_batch run --provider openai-compatible --task task.json \
+python -m llm_batch run --llm work/endpoint.toml --task task.json \
   --input path/to/your-sample.jsonl --db work/api.sqlite \
   --workers 8 --queue-size 64 --concurrency 4 --rpm 60
 ```
 
-`LLM_BASE_URL` 填接口根路径，如 `/v1`，适配器会追加 `/chat/completions`。真实请求请使用服务商的 HTTPS 地址，并按需要设定 `--tpm`。日志只记录运行指标、通用错误标识和必要的本地路径。SQLite 包含原始输入和模型结果，请按原数据的权限要求保存。
+如果连接配置使用其他 `api_key_env`，导出同名的环境变量。旧版 `--provider openai-compatible` 仍可读取 `LLM_BASE_URL`、`LLM_MODEL` 和 `LLM_API_KEY`，沿用 `max_completion_tokens`。两种方式择一使用。运行模拟模式可省略 `--llm` 和 `--provider`。
+
+真实请求请使用服务商的 HTTPS 地址，并按需要设定 `--tpm`。日志只记录运行指标、通用错误标识和必要的本地路径。SQLite 包含原始输入和模型结果，请按原数据的权限要求保存。
 
 真实请求启动前会检查提示词和 JSON Schema Draft 2020-12。请将复用的 schema 定义放在同一配置的 `$defs` 内。模拟模式返回空对象 `{}`，可用来检查批处理、写入和导出。
 
@@ -74,7 +85,7 @@ python -m llm_batch run --provider openai-compatible --task task.json \
 - `--rpm 60` 默认每秒最多开始一次请求。`--tpm 0` 默认关闭本地 token 预算，设为正数后按最近 60 秒累加估算量。每次预留使用输入和提示词的 UTF-8 字节数，再加输出 token 上限和固定开销。使用真实接口时按服务商的 token 计算调整 `estimate_tokens()`。多个进程共享服务商配额时，需要集中限流。重启会重置进程内的速率计数和冷却。
 - `--request-timeout 45` 约束一次调用。`--job-timeout 180` 从 worker 取件起计时，包含准入等待、请求和退避。输入队列等待与 SQLite 提交在这两个超时之外。`--max-attempts 3` 包含首次。
 - `--progress-interval 5` 控制日志间隔，`committed` 表示此次运行已提交的成功与失败条数，`goodput` 表示成功提交条数除以本次运行秒数。`request_p95` 以最新最多 1,024 次调用估算，从准入成功计时到单次调用及轻量响应处理结束。
-- 同一数据库同时只允许一个模板进程运行。续跑时用原 JSONL、原任务配置和同一数据库。输入内容、提示词、标签、schema、接口、模型或输出上限变化时，使用新数据库。并发、速率、时间预算和最大尝试次数可在续跑时调整。早期情感分类版创建的数据库仍可导出，使用新版运行时请选择新数据库。
+- 同一数据库同时只允许一个模板进程运行。续跑时用原 JSONL、原任务配置和同一数据库。输入内容、提示词、标签、schema、协议、端点、模型或输出上限字段及数值变化时，使用新数据库。只把旧版 Chat Completions 环境变量迁移到等价的连接配置时，可以续跑原数据库。并发、速率、时间预算和最大尝试次数可在续跑时调整。早期情感分类版创建的数据库仍可导出，使用新版运行时请选择新数据库。
 - 通常只会续跑 `pending` 项。已提交的 `failed` 项由 `--retry-failed` 显式纳入处理。若服务商已执行请求而 SQLite 尚未提交，续跑可能重发这条请求。导出的 `attempts` 累加已提交轮次中的尝试，进程在提交前被杀的尝试无法计入。服务端的幂等语义请按具体接口验证。
 
 ## 验证

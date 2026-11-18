@@ -3,12 +3,24 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .provider import RowError
+
 
 @dataclass(frozen=True)
 class Task:
     definition: dict[str, object]
     system_prompt: str
     is_valid: Callable[[object], bool]
+
+    def decode_result(self, raw: str) -> dict[str, object]:
+        try:
+            result = json.loads(raw)
+            if isinstance(result, dict) and self.is_valid(result):
+                json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                return result
+        except (ValueError, RecursionError):
+            pass
+        raise RowError("invalid_output_schema")
 
 
 def load_task(path: Path) -> Task:

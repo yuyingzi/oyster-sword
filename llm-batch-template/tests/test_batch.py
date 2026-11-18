@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from llm_batch.__main__ import main
 from llm_batch.control import RateLimiter, retry_after_seconds
 from llm_batch.pipeline import Settings, run
 from llm_batch.provider import FatalProviderError, OpenAICompatible, RetryableError, RowError
@@ -126,6 +128,16 @@ class CommandTests(unittest.TestCase):
         mock = self.invoke(self.batch(None, "--task", str(self.root / "missing.json")))
         self.assertEqual(mock.returncode, 0, mock.stderr)
 
+    def test_blank_connection_is_rejected_before_creating_checkpoint(self):
+        self.source.write_text('{"id":"a","text":"sample"}\n')
+        config = self.root / "blank-llm.toml"
+        config.write_text('protocol = "chat-completions"\nbase_url = ""\nmodel = ""\n'
+                          'api_key_env = "LLM_API_KEY"\noutput_limit_field = ""\n')
+        result = self.invoke(self.batch(None, "--llm", str(config)))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("base_url must be an HTTP(S) API root", result.stderr)
+        self.assertFalse(self.db.exists())
+
 
 class ControlTests(unittest.TestCase):
     def test_pacing_and_token_window(self):
@@ -193,6 +205,9 @@ class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
             httpx.Response(429, headers={"Retry-After": "2"}),
             httpx.Response(429, json={"error": {"code": "insufficient_quota"}}),
             httpx.Response(401),
+            httpx.ReadTimeout("test timeout"),
+            httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {}}]}),
+            httpx.Response(200, json={"choices": [{"message": {"content": 'invalid JSON'}}]}),
             httpx.Response(200, json={"choices": [{"message": {"content": '{"score":"2","codes":["A"]}'}}]}),
         ])
 
@@ -204,7 +219,10 @@ class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Label vocabulary: ["A"]', body["messages"][0]["content"])
             self.assertIn('"score"', body["messages"][0]["content"])
             self.assertEqual(body["max_completion_tokens"], 128)
-            return next(responses)
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
 
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "task.json"
@@ -217,8 +235,8 @@ class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(task.is_valid({"score": 2, "codes": ["B"]}))
 
         async with httpx.AsyncClient(base_url="https://example.test/v1/", transport=httpx.MockTransport(handler)) as client:
-            adapter = OpenAICompatible(client, "test-model", 128, task)
-            self.assertEqual(await adapter.complete("sample text"), result)
+            adapter = OpenAICompatible(client, "test-model", 128, task.system_prompt)
+            self.assertEqual(task.decode_result(await adapter.complete("sample text")), result)
             with self.assertRaises(RetryableError) as retry:
                 await adapter.complete("sample text")
             self.assertEqual(retry.exception.retry_after, 2)
@@ -226,5 +244,81 @@ class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 await adapter.complete("sample text")
             with self.assertRaisesRegex(FatalProviderError, "provider_setup_http_401"):
                 await adapter.complete("sample text")
-            with self.assertRaisesRegex(RowError, "invalid_output_schema"):
+            with self.assertRaisesRegex(RetryableError, "http_timeout"):
                 await adapter.complete("sample text")
+            with self.assertRaisesRegex(RowError, "output_truncated"):
+                await adapter.complete("sample text")
+            for _ in range(2):
+                with self.assertRaisesRegex(RowError, "invalid_output_schema"):
+                    task.decode_result(await adapter.complete("sample text"))
+
+
+@unittest.skipUnless(
+    all(importlib.util.find_spec(module) for module in ("httpx", "jsonschema")),
+    "install requirements.txt to test LLM connection configuration",
+)
+class ConnectionTests(unittest.TestCase):
+    def test_cli_switches_token_field_and_protects_checkpoint(self):
+        import httpx
+
+        client_class = httpx.AsyncClient
+        calls = []
+
+        def handler(request):
+            calls.append((str(request.url), request.headers["Authorization"], json.loads(request.content)))
+            return httpx.Response(200, json={"choices": [{"message": {"content": '{"value":7}'}}]})
+
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "input.jsonl"
+            source.write_text('{"id":"a","text":"sample"}\n')
+            task = folder / "task.json"
+            task.write_text('{"prompt":"Test prompt","output_schema":{"type":"object","required":["value"]}}\n')
+            config = folder / "llm.toml"
+            db = folder / "legacy.sqlite"
+            connection = ('protocol = "chat-completions"\nbase_url = "https://example.test/gateway/v1/"\n'
+                          'model = "test-model"\napi_key_env = "CUSTOM_KEY"\n')
+
+            def invoke(db_path, *options):
+                argv = ["llm_batch", "run", "--input", str(source), "--db", str(db_path), "--task", str(task), *options]
+                with patch.object(sys, "argv", argv):
+                    return main()
+
+            with patch.dict(os.environ, {
+                "LLM_BASE_URL": "https://example.test/gateway/v1", "LLM_MODEL": "test-model",
+                "LLM_API_KEY": "legacy-test-key", "CUSTOM_KEY": "configured-test-key",
+            }, clear=True), patch.object(httpx, "AsyncClient", side_effect=lambda **kwargs: client_class(
+                **kwargs, transport=httpx.MockTransport(handler)
+            )):
+                self.assertEqual(invoke(db, "--provider", "openai-compatible"), 0)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][1], "Bearer legacy-test-key")
+                self.assertEqual(calls[0][2]["max_completion_tokens"], 128)
+                self.assertNotIn("max_tokens", calls[0][2])
+                with closing(sqlite3.connect(db)) as conn, conn:
+                    signature = json.loads(conn.execute("SELECT signature FROM run_metadata").fetchone()[0])
+                    self.assertEqual(signature.pop("protocol"), "chat-completions")
+                    self.assertEqual(signature.pop("output_limit_field"), "max_completion_tokens")
+                    conn.execute("UPDATE run_metadata SET signature=?", (json.dumps(signature, sort_keys=True),))
+
+                config.write_text(connection + 'output_limit_field = "max_completion_tokens"\n')
+                self.assertEqual(invoke(db, "--llm", str(config)), 0)
+                self.assertEqual(len(calls), 1)
+                config.write_text(connection + 'output_limit_field = "max_tokens"\n')
+                with self.assertLogs("llm_batch.__main__", level="ERROR") as logs:
+                    self.assertEqual(invoke(db, "--llm", str(config)), 1)
+                self.assertIn("input or task settings changed", logs.output[0])
+                self.assertEqual(len(calls), 1)
+
+                fresh_db = folder / "configured.sqlite"
+                self.assertEqual(invoke(fresh_db, "--llm", str(config)), 0)
+                self.assertEqual(len(calls), 2)
+                url, authorization, body = calls[1]
+                self.assertEqual(url, "https://example.test/gateway/v1/chat/completions")
+                self.assertEqual(authorization, "Bearer configured-test-key")
+                self.assertEqual(body["max_tokens"], 128)
+                self.assertNotIn("max_completion_tokens", body)
+                with closing(sqlite3.connect(fresh_db)) as conn:
+                    signature = conn.execute("SELECT signature FROM run_metadata").fetchone()[0]
+                    self.assertNotIn("configured-test-key", signature)
+                    self.assertEqual(json.loads(conn.execute("SELECT result FROM jobs").fetchone()[0]), {"value": 7})
