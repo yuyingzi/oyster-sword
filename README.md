@@ -21,6 +21,9 @@ Multi-account CLI switching for agents — each workspace declares which account
 ### `codex-deepseek-profile/`
 Run Codex with `deepseek-v4-flash` through an isolated profile while keeping the default OpenAI configuration unchanged. Includes a safe installer, status/uninstall commands, and an isolated install test.
 
+### `llm-batch-template/`
+Reusable Python template for concurrent LLM batch jobs with rate limits, retries, SQLite checkpoints, and progress monitoring. See the [template README](llm-batch-template/README.md).
+
 ## Setup
 
 ```bash

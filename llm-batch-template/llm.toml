@@ -1,0 +1,5 @@
+protocol = "chat-completions"
+base_url = ""
+model = ""
+api_key_env = "LLM_API_KEY"
+output_limit_field = ""  # max_completion_tokens or max_tokens
