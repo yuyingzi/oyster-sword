@@ -103,7 +103,7 @@ class Store:
         )
         return [Job(seq, text) for seq, text in rows]
 
-    def finish(self, job: Job, result: dict[str, str] | None, error: str | None, attempts: int) -> None:
+    def finish(self, job: Job, result: dict[str, object] | None, error: str | None, attempts: int) -> None:
         payload = json.dumps(result, ensure_ascii=False) if result is not None else None
         status = "succeeded" if result is not None else "failed"
         with self.connection:

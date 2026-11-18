@@ -1,21 +1,21 @@
 # Python LLM 批处理模板
 
-适用于 macOS 或 Linux 上使用 Python 3.11+ 批量做文本分类、信息抽取或评测。示例把一条 JSONL 记录映射为一次在线模型请求，用 SQLite 保存输入和处理状态。模拟模式只依赖 Python 标准库。
+适用于 macOS 或 Linux 上使用 Python 3.11+ 批量做文本编码、信息抽取或评测。每条 JSONL 记录对应一次模型请求，用 SQLite 保存输入和处理状态。任务的提示词、标签和输出 schema 集中在空白的 [`task.json`](task.json) 中，等你有具体任务时填写。模拟模式只依赖 Python 标准库。
 
 ## 跑通示例
 
 从本目录执行以下命令。第二次运行会跳过三条已提交的记录，日志应显示 `scheduled=0` 与 `attempts=0`。
 
 ```bash
-python3 -m llm_batch run --input examples/reviews.jsonl --db work/reviews.sqlite
-python3 -m llm_batch run --input examples/reviews.jsonl --db work/reviews.sqlite
-python3 -m llm_batch export --db work/reviews.sqlite --output work/results.jsonl
+python3 -m llm_batch run --input examples/smoke.jsonl --db work/smoke.sqlite
+python3 -m llm_batch run --input examples/smoke.jsonl --db work/smoke.sqlite
+python3 -m llm_batch export --db work/smoke.sqlite --output work/results.jsonl
 ```
 
 输入每行包含字符串 `id` 和 `text`。`id` 在文件内唯一，并由数据源稳定提供。导出按输入顺序包含已提交的成功和失败记录，输出文件名须未被占用。
 
 ```json
-{"id":"review-001","status":"succeeded","result":{"label":"positive"},"error":null,"attempts":1}
+{"id":"sample-001","status":"succeeded","result":{},"error":null,"attempts":1}
 ```
 
 用以下命令演练临时限流、无效输出和单次超时。第一条命令预期返回退出码 `2`，随后仍可以导出结果。重跑时追加 `--retry-failed` 会重新处理已提交的失败项，模拟失败仍会复现。
@@ -31,7 +31,7 @@ python3 -m llm_batch export --db work/failures.sqlite --output work/failures.jso
 ## 接入自己的数据和模型
 
 1. 把源数据转换成 UTF-8 JSONL，选择稳定的 `id`，把用于模型处理的字段组装为 `text`。保留相同输入文件以便续跑。
-2. 修改 [`provider.py`](llm_batch/provider.py) 中的 `SYSTEM_PROMPT`、`validate()` 和 `TASK_VERSION`。适配器示例返回 `{"label":"positive"}`。改为抽取或评测时，同步修改返回类型和 `mock_complete()`，让模拟测试覆盖你真正需要的字段和失败样例。
+2. 填写 [`task.json`](task.json) 的 `prompt` 和 `output_schema`。有标签词表时再填写 `labels`，它会随提示词发给模型。字段名、字段类型、必填项和允许值由 JSON Schema 决定。如果标签需要严格校验，在对应字段的 schema 里用 `enum`。输出为 JSON 对象，内部可以包含数组、数值或嵌套对象。需要自定义配置路径时传入 `--task`。
 3. 选择新数据库，用小样本跑通输入、校验、持久化、导出和续跑，再按服务商配额压测。实际 HTTP 适配器使用 `/chat/completions` 和 `max_completion_tokens`。如果你的兼容接口使用其他字段，请修改适配器的请求与响应映射。
 
 ```bash
@@ -44,12 +44,14 @@ printf 'LLM API key: '
 IFS= read -rs LLM_API_KEY
 printf '\n'
 export LLM_API_KEY
-python -m llm_batch run --provider openai-compatible \
-  --input examples/reviews.jsonl --db work/api.sqlite \
+python -m llm_batch run --provider openai-compatible --task task.json \
+  --input path/to/your-sample.jsonl --db work/api.sqlite \
   --workers 8 --queue-size 64 --concurrency 4 --rpm 60
 ```
 
 `LLM_BASE_URL` 填接口根路径，如 `/v1`，适配器会追加 `/chat/completions`。真实请求请使用服务商的 HTTPS 地址，并按需要设定 `--tpm`。日志只记录运行指标、通用错误标识和必要的本地路径。SQLite 包含原始输入和模型结果，请按原数据的权限要求保存。
+
+真实请求启动前会检查提示词和 JSON Schema Draft 2020-12。请将复用的 schema 定义放在同一配置的 `$defs` 内。模拟模式返回空对象 `{}`，可用来检查批处理、写入和导出。
 
 ## 模块与给 AI 的需求
 
@@ -72,7 +74,7 @@ python -m llm_batch run --provider openai-compatible \
 - `--rpm 60` 默认每秒最多开始一次请求。`--tpm 0` 默认关闭本地 token 预算，设为正数后按最近 60 秒累加估算量。每次预留使用输入和提示词的 UTF-8 字节数，再加输出 token 上限和固定开销。使用真实接口时按服务商的 token 计算调整 `estimate_tokens()`。多个进程共享服务商配额时，需要集中限流。重启会重置进程内的速率计数和冷却。
 - `--request-timeout 45` 约束一次调用。`--job-timeout 180` 从 worker 取件起计时，包含准入等待、请求和退避。输入队列等待与 SQLite 提交在这两个超时之外。`--max-attempts 3` 包含首次。
 - `--progress-interval 5` 控制日志间隔，`committed` 表示此次运行已提交的成功与失败条数，`goodput` 表示成功提交条数除以本次运行秒数。`request_p95` 以最新最多 1,024 次调用估算，从准入成功计时到单次调用及轻量响应处理结束。
-- 同一数据库同时只允许一个模板进程运行。续跑时用原 JSONL 和同一数据库。输入内容、提示词、任务版本、接口、模型或输出上限变化时，使用新数据库。并发、速率、时间预算和最大尝试次数可在续跑时调整。修改业务解析语义后请更新 `TASK_VERSION`。
+- 同一数据库同时只允许一个模板进程运行。续跑时用原 JSONL、原任务配置和同一数据库。输入内容、提示词、标签、schema、接口、模型或输出上限变化时，使用新数据库。并发、速率、时间预算和最大尝试次数可在续跑时调整。早期情感分类版创建的数据库仍可导出，使用新版运行时请选择新数据库。
 - 通常只会续跑 `pending` 项。已提交的 `failed` 项由 `--retry-failed` 显式纳入处理。若服务商已执行请求而 SQLite 尚未提交，续跑可能重发这条请求。导出的 `attempts` 累加已提交轮次中的尝试，进程在提交前被杀的尝试无法计入。服务端的幂等语义请按具体接口验证。
 
 ## 验证

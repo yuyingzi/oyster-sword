@@ -18,6 +18,7 @@ from llm_batch.control import RateLimiter, retry_after_seconds
 from llm_batch.pipeline import Settings, run
 from llm_batch.provider import FatalProviderError, OpenAICompatible, RetryableError, RowError
 from llm_batch.store import AsyncStore, Store
+from llm_batch.task import load_task
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,12 +64,12 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         records = [json.loads(line) for line in self.output.read_text().splitlines()]
         self.assertEqual([row["id"] for row in records], [row[0] for row in self.rows()])
-        self.assertEqual(records[0]["result"], {"label": "positive"})
+        self.assertEqual(records[0]["result"], {})
         self.assertEqual(records[1]["error"], "invalid_output_schema")
         self.assertEqual(self.invoke(export).returncode, 1)
 
     def test_kill_and_resume_skips_committed_rows(self):
-        self.source.write_text(''.join(json.dumps({"id": str(i), "text": "Great"}) + "\n" for i in range(12)))
+        self.source.write_text(''.join(json.dumps({"id": str(i), "text": "Sample"}) + "\n" for i in range(12)))
         process = subprocess.Popen(self.batch(rpm="120"), cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 6
@@ -114,6 +115,17 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(changed_input.returncode, 1)
         self.assertIn("input or task settings changed", changed_input.stderr)
 
+    def test_blank_task_blocks_real_requests_but_mock_runs_without_task(self):
+        self.source.write_text('{"id":"a","text":"sample"}\n')
+        task_path = self.root / "blank-task.json"
+        task_path.write_text('{"prompt":"","labels":[],"output_schema":{}}\n')
+        result = self.invoke(self.batch(None, "--provider", "openai-compatible", "--task", str(task_path)))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("fill in prompt and output_schema", result.stderr)
+        self.assertFalse(self.db.exists())
+        mock = self.invoke(self.batch(None, "--task", str(self.root / "missing.json")))
+        self.assertEqual(mock.returncode, 0, mock.stderr)
+
 
 class ControlTests(unittest.TestCase):
     def test_pacing_and_token_window(self):
@@ -151,7 +163,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             peak = max(peak, in_flight)
             try:
                 await asyncio.sleep(0.03)
-                return {"label": "neutral"}
+                return {"value": 1}
             finally:
                 in_flight -= 1
 
@@ -167,35 +179,52 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(peak, 3)
 
 
-@unittest.skipUnless(importlib.util.find_spec("httpx"), "install requirements.txt to test the HTTP adapter")
+@unittest.skipUnless(
+    all(importlib.util.find_spec(module) for module in ("httpx", "jsonschema")),
+    "install requirements.txt to test the HTTP adapter",
+)
 class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_and_response_mapping(self):
         import httpx
 
+        result = {"score": 2, "codes": ["A"]}
         responses = iter([
-            httpx.Response(200, json={"choices": [{"message": {"content": '{"label":"positive"}'}}]}),
+            httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(result)}}]}),
             httpx.Response(429, headers={"Retry-After": "2"}),
             httpx.Response(429, json={"error": {"code": "insufficient_quota"}}),
             httpx.Response(401),
-            httpx.Response(200, json={"choices": [{"message": {"content": '[]'}}]}),
+            httpx.Response(200, json={"choices": [{"message": {"content": '{"score":"2","codes":["A"]}'}}]}),
         ])
 
         def handler(request):
             self.assertEqual(str(request.url), "https://example.test/v1/chat/completions")
             body = json.loads(request.content)
-            self.assertEqual(body["messages"][1]["content"], "a review")
+            self.assertEqual(body["messages"][1]["content"], "sample text")
+            self.assertTrue(body["messages"][0]["content"].startswith("Test prompt"))
+            self.assertIn('Label vocabulary: ["A"]', body["messages"][0]["content"])
+            self.assertIn('"score"', body["messages"][0]["content"])
             self.assertEqual(body["max_completion_tokens"], 128)
             return next(responses)
 
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "task.json"
+            path.write_text(json.dumps({"prompt": "Test prompt", "labels": ["A"], "output_schema": {
+                "type": "object", "required": ["score", "codes"],
+                "properties": {"score": {"type": "integer"}, "codes": {"$ref": "#/$defs/codes"}},
+                "$defs": {"codes": {"type": "array", "items": {"enum": ["A"]}}},
+            }}))
+            task = load_task(path)
+            self.assertFalse(task.is_valid({"score": 2, "codes": ["B"]}))
+
         async with httpx.AsyncClient(base_url="https://example.test/v1/", transport=httpx.MockTransport(handler)) as client:
-            adapter = OpenAICompatible(client, "test-model", 128)
-            self.assertEqual(await adapter.complete("a review"), {"label": "positive"})
+            adapter = OpenAICompatible(client, "test-model", 128, task)
+            self.assertEqual(await adapter.complete("sample text"), result)
             with self.assertRaises(RetryableError) as retry:
-                await adapter.complete("a review")
+                await adapter.complete("sample text")
             self.assertEqual(retry.exception.retry_after, 2)
             with self.assertRaisesRegex(FatalProviderError, "provider_quota_exhausted"):
-                await adapter.complete("a review")
+                await adapter.complete("sample text")
             with self.assertRaisesRegex(FatalProviderError, "provider_setup_http_401"):
-                await adapter.complete("a review")
+                await adapter.complete("sample text")
             with self.assertRaisesRegex(RowError, "invalid_output_schema"):
-                await adapter.complete("a review")
+                await adapter.complete("sample text")

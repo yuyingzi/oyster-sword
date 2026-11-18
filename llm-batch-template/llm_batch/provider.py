@@ -7,13 +7,8 @@ from .control import retry_after_seconds
 if TYPE_CHECKING:
     import httpx
 
+    from .task import Task
 
-TASK_VERSION = "sentiment-v1"
-SYSTEM_PROMPT = (
-    'Classify the sentiment of the user text as positive, neutral, or negative. '
-    'Return exactly one JSON object with a single string field named "label".'
-)
-LABELS = {"positive", "neutral", "negative"}
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 QUOTA_ERROR_CODES = {"insufficient_quota", "billing_hard_limit_reached"}
 
@@ -33,52 +28,37 @@ class RetryableError(Exception):
         self.retry_after = retry_after
 
 
-def validate(raw: str) -> dict[str, str]:
-    try:
-        result = json.loads(raw)
-        if isinstance(result, dict) and set(result) == {"label"}:
-            label = result["label"]
-            if isinstance(label, str) and label in LABELS:
-                return {"label": label}
-    except (TypeError, ValueError, RecursionError):
-        pass
-    raise RowError("invalid_output_schema")
-
-
-def estimate_tokens(text: str, max_output_tokens: int) -> int:
+def estimate_tokens(text: str, max_output_tokens: int, system_prompt: str = "") -> int:
     # Byte count is a coarse reservation. Use the provider's accounting if TPM binds.
-    return len((SYSTEM_PROMPT + text).encode("utf-8")) + max_output_tokens + 32
+    return len((system_prompt + text).encode("utf-8")) + max_output_tokens + 32
 
 
-async def mock_complete(text: str) -> dict[str, str]:
+async def mock_complete(text: str) -> dict[str, object]:
     await asyncio.sleep(0.05)
     if text == "[mock:invalid]":
-        return validate("not JSON")
+        raise RowError("invalid_output_schema")
     if text == "[mock:429]":
         raise RetryableError("http_429", status=429, retry_after=0.1)
     if text == "[mock:timeout]":
         await asyncio.sleep(60)
-    if any(word in text.lower() for word in ("great", "很好", "喜欢")):
-        return {"label": "positive"}
-    if any(word in text.lower() for word in ("awful", "太差")):
-        return {"label": "negative"}
-    return {"label": "neutral"}
+    return {}
 
 
 class OpenAICompatible:
-    def __init__(self, client: "httpx.AsyncClient", model: str, max_output_tokens: int) -> None:
+    def __init__(self, client: "httpx.AsyncClient", model: str, max_output_tokens: int, task: "Task") -> None:
         self.client = client
         self.model = model
         self.max_output_tokens = max_output_tokens
+        self.task = task
 
-    async def complete(self, text: str) -> dict[str, str]:
+    async def complete(self, text: str) -> dict[str, object]:
         import httpx
 
         try:
             response = await self.client.post("chat/completions", json={
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self.task.system_prompt},
                     {"role": "user", "content": text},
                 ],
                 "max_completion_tokens": self.max_output_tokens,
@@ -118,4 +98,11 @@ class OpenAICompatible:
                 raise RowError("invalid_provider_response")
         except (KeyError, IndexError, TypeError, ValueError, RecursionError) as error:
             raise RowError("invalid_provider_response") from error
-        return validate(raw)
+        try:
+            result = json.loads(raw)
+            if isinstance(result, dict) and self.task.is_valid(result):
+                json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                return result
+        except (ValueError, RecursionError):
+            pass
+        raise RowError("invalid_output_schema")

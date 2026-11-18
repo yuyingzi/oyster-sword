@@ -10,8 +10,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .pipeline import Settings, run
-from .provider import FatalProviderError, OpenAICompatible, SYSTEM_PROMPT, TASK_VERSION, mock_complete
+from .provider import FatalProviderError, OpenAICompatible, mock_complete
 from .store import AsyncStore, Store, export_results, lock_run
+from .task import Task, load_task
 
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     batch.add_argument("--input", type=Path, required=True, help="JSONL with string id and text fields")
     batch.add_argument("--db", type=Path, required=True, help="SQLite checkpoint path")
     batch.add_argument("--provider", choices=("mock", "openai-compatible"), default="mock")
+    batch.add_argument("--task", type=Path, default=Path("task.json"), help="task JSON for the API adapter")
     batch.add_argument("--workers", type=positive_int, default=8)
     batch.add_argument("--queue-size", type=positive_int, default=64)
     batch.add_argument("--concurrency", type=positive_int, default=4, help="maximum in-flight requests")
@@ -59,9 +61,9 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run_provider(
-    database: AsyncStore, settings: Settings, provider: str, endpoint: str, model: str, key: str,
+    database: AsyncStore, settings: Settings, task: Task | None, endpoint: str, model: str, key: str,
 ) -> dict[str, int]:
-    if provider == "mock":
+    if task is None:
         return await run(database, mock_complete, settings)
 
     import httpx
@@ -71,8 +73,8 @@ async def run_provider(
     async with httpx.AsyncClient(
         base_url=endpoint + "/", headers={"Authorization": f"Bearer {key}"}, limits=limits, timeout=timeouts,
     ) as client:
-        adapter = OpenAICompatible(client, model, settings.max_output_tokens)
-        return await run(database, adapter.complete, settings)
+        adapter = OpenAICompatible(client, model, settings.max_output_tokens, task)
+        return await run(database, adapter.complete, settings, system_prompt=task.system_prompt)
 
 
 def start(args: argparse.Namespace) -> int:
@@ -80,7 +82,9 @@ def start(args: argparse.Namespace) -> int:
     if source == db_path or source == db_path.with_name(db_path.name + ".lock"):
         raise ValueError("input and checkpoint paths must be distinct")
     endpoint, model, key = "", "", ""
+    task = None
     if args.provider == "openai-compatible":
+        task = load_task(args.task)
         try:
             import httpx  # noqa: F401
         except ModuleNotFoundError as error:
@@ -95,17 +99,17 @@ def start(args: argparse.Namespace) -> int:
             raise ValueError("set LLM_MODEL and LLM_API_KEY for the API adapter")
 
     settings = Settings(**{name: getattr(args, name) for name in Settings.__annotations__})
-    task = {"version": TASK_VERSION, "prompt": SYSTEM_PROMPT, "provider": args.provider,
-            "endpoint": endpoint, "model": model, "max_output_tokens": settings.max_output_tokens}
+    signature = {"task": task.definition if task else None, "provider": args.provider,
+                 "endpoint": endpoint, "model": model, "max_output_tokens": settings.max_output_tokens}
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_run(db_path), closing(sqlite3.connect(db_path, check_same_thread=False)) as connection:
         store = Store(connection)
         log.info("loading or verifying input for %s", db_path)
-        store.initialize(source, task)
+        store.initialize(source, signature)
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite") as executor:
             database = AsyncStore(store, executor)
             try:
-                counts = asyncio.run(run_provider(database, settings, args.provider, endpoint, model, key))
+                counts = asyncio.run(run_provider(database, settings, task, endpoint, model, key))
             except* FatalProviderError as group:
                 raise FatalProviderError(str(group.exceptions[0])) from None
     log.info("done pending=%d succeeded=%d failed=%d", counts["pending"], counts["succeeded"], counts["failed"])

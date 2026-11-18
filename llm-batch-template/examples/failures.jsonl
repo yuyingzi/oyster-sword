@@ -1,4 +1,4 @@
-{"id":"ok","text":"Great experience."}
+{"id":"ok","text":"Sample input"}
 {"id":"bad-output","text":"[mock:invalid]"}
 {"id":"rate-limited","text":"[mock:429]"}
 {"id":"slow","text":"[mock:timeout]"}

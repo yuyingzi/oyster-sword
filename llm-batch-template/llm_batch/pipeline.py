@@ -13,7 +13,7 @@ from .store import AsyncStore, Job
 
 
 log = logging.getLogger(__name__)
-ModelCall = Callable[[str], Awaitable[dict[str, str]]]
+ModelCall = Callable[[str], Awaitable[dict[str, object]]]
 
 
 @dataclass(frozen=True)
@@ -61,8 +61,9 @@ class Progress:
 async def process(
     job: Job, complete: ModelCall, settings: Settings,
     limiter: RateLimiter, slots: asyncio.Semaphore, progress: Progress,
-) -> tuple[dict[str, str] | None, str | None, int]:
-    tokens = estimate_tokens(job.text, settings.max_output_tokens) if settings.tpm else 0
+    system_prompt: str,
+) -> tuple[dict[str, object] | None, str | None, int]:
+    tokens = estimate_tokens(job.text, settings.max_output_tokens, system_prompt) if settings.tpm else 0
     if settings.tpm and tokens > settings.tpm:
         return None, "token_estimate_exceeds_tpm", 0
 
@@ -98,7 +99,7 @@ async def process(
         return None, str(error), attempts
 
 
-async def request(complete: ModelCall, text: str, timeout: float, progress: Progress) -> dict[str, str]:
+async def request(complete: ModelCall, text: str, timeout: float, progress: Progress) -> dict[str, object]:
     progress.in_flight += 1
     started = monotonic()
     try:
@@ -111,7 +112,9 @@ async def request(complete: ModelCall, text: str, timeout: float, progress: Prog
         progress.latencies.append(monotonic() - started)
 
 
-async def run(database: AsyncStore, complete: ModelCall, settings: Settings) -> dict[str, int]:
+async def run(
+    database: AsyncStore, complete: ModelCall, settings: Settings, *, system_prompt: str = "",
+) -> dict[str, int]:
     store = database.store
     initial = await database.call(store.counts)
     target = initial["pending"] + (initial["failed"] if settings.retry_failed else 0)
@@ -129,7 +132,7 @@ async def run(database: AsyncStore, complete: ModelCall, settings: Settings) -> 
             try:
                 if job is None:
                     return
-                result, error, attempts = await process(job, complete, settings, limiter, slots, progress)
+                result, error, attempts = await process(job, complete, settings, limiter, slots, progress, system_prompt)
                 await database.call(store.finish, job, result, error, attempts)
                 if error:
                     progress.failed += 1
